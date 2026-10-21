@@ -1,0 +1,322 @@
+# Adapted from HalfVulpes/Deepinfer-SM80 @2a828fc, patches/vllm-sm80-deepinfer.patch (Apache-2.0):
+# sparse-attention decode hunks (17 of the 18 apply; the build tolerates the rejected one and checks the key function landed).
+# Applied with `patch -p1` from the image's site-packages directory.
+--- a/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
++++ b/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py
+@@ -1571,14 +1571,14 @@
+     out_ptr,
+     q_stride_t,
+     q_stride_h,
+-    q_stride_d,
++    q_stride_d: tl.constexpr,
+     kv_stride_n,
+-    kv_stride_d,
++    kv_stride_d: tl.constexpr,
+     out_stride_t,
+     out_stride_h,
+-    out_stride_d,
+-    num_heads,
+-    head_dim,
++    out_stride_d: tl.constexpr,
++    num_heads: tl.constexpr,
++    head_dim: tl.constexpr,
+     num_kv,
+     scale,
+     HAS_ATTN_SINK: tl.constexpr,
+@@ -1989,6 +1989,13 @@
+         out_rope,
+         mask=head_mask[:, None],
+     )
++
++
++@triton.jit
++def _decode_e8m0_scales_bf16_triton(encoded_scales):
++    """Bit-shift UE8M0 bytes to BF16: (e << 7) is the exact IEEE 754 BF16 representation of 2^(e - 127)."""
++    bits = (encoded_scales.to(tl.uint16) & 0xFF) << 7
++    return tl.where(encoded_scales == 0, 0, bits).to(tl.bfloat16, bitcast=True)
+ 
+ 
+ @triton.jit
+@@ -2040,18 +2047,14 @@
+ 
+     head_offsets = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
+     head_mask = head_offsets < num_heads
+-    nope_offsets = tl.arange(0, NOPE_BLOCK)
+-    nope_mask = nope_offsets < NOPE_DIM
+-    rope_offsets = tl.arange(0, ROPE_DIM)
++
++    # Unified [0..512) dimension tile: [0:448] is NoPE (FP8), [448:512] is RoPE (BF16)
++    comb_offsets = tl.arange(0, NOPE_BLOCK)
++    nope_mask = comb_offsets < NOPE_DIM
+ 
+     q_row_ptr = q_ptr + query_idx * q_stride0 + head_offsets[:, None] * q_stride1
+-    q_nope = tl.load(
+-        q_row_ptr + nope_offsets[None, :],
+-        mask=head_mask[:, None] & nope_mask[None, :],
+-        other=0.0,
+-    )
+-    q_rope = tl.load(
+-        q_row_ptr + NOPE_DIM + rope_offsets[None, :],
++    q_comb = tl.load(
++        q_row_ptr + comb_offsets[None, :],
+         mask=head_mask[:, None],
+         other=0.0,
+     )
+@@ -2059,16 +2062,11 @@
+     neg_large = -3.4028234663852886e38
+     m_i = tl.full((BLOCK_H,), neg_large, dtype=tl.float32)
+     l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
+-    acc_nope = tl.zeros((BLOCK_H, NOPE_BLOCK), dtype=tl.float32)
+-    acc_rope = tl.zeros((BLOCK_H, ROPE_DIM), dtype=tl.float32)
++    acc_comb = tl.zeros((BLOCK_H, NOPE_BLOCK), dtype=tl.float32)
+     k_offsets = tl.arange(0, BLOCK_K)
+-
+-    zero_nope = tl.zeros((BLOCK_K, NOPE_BLOCK), dtype=tl.bfloat16)
+-    zero_rope = tl.zeros((BLOCK_K, ROPE_DIM), dtype=tl.bfloat16)
+-
+-    # Each split processes a contiguous slice of this query's main (SWA) and
+-    # extra (topk) segments. Slices are handled independently so a block never
+-    # straddles the main/extra boundary.
++    scale_offsets = tl.arange(0, 8)
++    zero_comb = tl.zeros((BLOCK_K, NOPE_BLOCK), dtype=tl.bfloat16)
++
+     main_start = tl.load(main_indptr_ptr + query_idx)
+     main_end = tl.load(main_indptr_ptr + query_idx + 1)
+     main_len = main_end - main_start
+@@ -2090,32 +2088,36 @@
+         token_scale_ptr = cache_block_ptr + main_block_size * 576 + pos_in_block * 8
+ 
+         x_uint8 = tl.load(
+-            token_data_ptr[:, None] + nope_offsets[None, :],
++            token_data_ptr[:, None] + comb_offsets[None, :],
+             mask=valid[:, None] & nope_mask[None, :],
+             other=0,
+         )
+         k_vals = _decode_fp8_lut(x_uint8, IS_FNUZ_MAIN, fp8_lut_ptr)
++
+         encoded_scales = tl.load(
+-            token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
+-            mask=valid[:, None] & nope_mask[None, :],
++            token_scale_ptr[:, None] + scale_offsets[None, :],
++            mask=valid[:, None],
+             other=127,
+         )
+-        scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
+-        k_nope = k_vals.to(tl.bfloat16) * scales.to(tl.bfloat16)
+-        k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
+-        k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
++        scales = _decode_e8m0_scales_bf16_triton(encoded_scales)
++        scales_512 = tl.reshape(
++            tl.broadcast_to(scales[:, :, None], (BLOCK_K, 8, 64)),
++            (BLOCK_K, NOPE_BLOCK),
++        )
++        k_nope = k_vals * scales_512
+ 
+         rope_ptr = (token_data_ptr + NOPE_DIM).to(tl.pointer_type(tl.bfloat16))
+         k_rope = tl.load(
+-            rope_ptr[:, None] + rope_offsets[None, :],
+-            mask=valid[:, None],
++            rope_ptr[:, None] + (comb_offsets[None, :] - NOPE_DIM),
++            mask=valid[:, None] & ~nope_mask[None, :],
+             other=0.0,
+         )
+-        k_rope = tl.where(valid[:, None], k_rope, zero_rope)
+-        k_rope = tl.where(k_rope == k_rope, k_rope, zero_rope)
+-
+-        scores = tl.dot(q_nope, tl.trans(k_nope)) + tl.dot(q_rope, tl.trans(k_rope))
+-        scores *= scale
++
++        k_comb = tl.where(nope_mask[None, :], k_nope, k_rope)
++        k_comb = tl.where(valid[:, None], k_comb, zero_comb)
++        k_comb = tl.where(k_comb == k_comb, k_comb, zero_comb)
++
++        scores = tl.dot(q_comb, tl.trans(k_comb)) * scale
+         scores = tl.where(head_mask[:, None] & valid[None, :], scores, neg_large)
+ 
+         m_block = tl.max(scores, axis=1)
+@@ -2125,8 +2127,7 @@
+         p = tl.where(head_mask[:, None] & valid[None, :], p, 0.0)
+         l_new = l_i * alpha + tl.sum(p, axis=1)
+ 
+-        acc_nope = acc_nope * alpha[:, None] + tl.dot(p.to(k_nope.dtype), k_nope)
+-        acc_rope = acc_rope * alpha[:, None] + tl.dot(p.to(k_rope.dtype), k_rope)
++        acc_comb = acc_comb * alpha[:, None] + tl.dot(p.to(k_comb.dtype), k_comb)
+         m_i = m_new
+         l_i = l_new
+ 
+@@ -2158,35 +2159,36 @@
+             )
+ 
+             x_uint8 = tl.load(
+-                token_data_ptr[:, None] + nope_offsets[None, :],
++                token_data_ptr[:, None] + comb_offsets[None, :],
+                 mask=valid[:, None] & nope_mask[None, :],
+                 other=0,
+             )
+             k_vals = _decode_fp8_lut(x_uint8, IS_FNUZ_EXTRA, fp8_lut_ptr)
++
+             encoded_scales = tl.load(
+-                token_scale_ptr[:, None] + nope_offsets[None, :] // 64,
+-                mask=valid[:, None] & nope_mask[None, :],
++                token_scale_ptr[:, None] + scale_offsets[None, :],
++                mask=valid[:, None],
+                 other=127,
+             )
+-            scales = tl.exp2(encoded_scales.to(tl.float32) - 127.0)
+-            k_nope = k_vals.to(tl.bfloat16) * scales.to(tl.bfloat16)
+-            k_nope = tl.where(valid[:, None] & nope_mask[None, :], k_nope, zero_nope)
+-            k_nope = tl.where(k_nope == k_nope, k_nope, zero_nope)
++            scales = _decode_e8m0_scales_bf16_triton(encoded_scales)
++            scales_512 = tl.reshape(
++                tl.broadcast_to(scales[:, :, None], (BLOCK_K, 8, 64)),
++                (BLOCK_K, NOPE_BLOCK),
++            )
++            k_nope = k_vals * scales_512
+ 
+             rope_ptr = (token_data_ptr + NOPE_DIM).to(tl.pointer_type(tl.bfloat16))
+             k_rope = tl.load(
+-                rope_ptr[:, None] + rope_offsets[None, :],
+-                mask=valid[:, None],
++                rope_ptr[:, None] + (comb_offsets[None, :] - NOPE_DIM),
++                mask=valid[:, None] & ~nope_mask[None, :],
+                 other=0.0,
+             )
+-            k_rope = tl.where(valid[:, None], k_rope, zero_rope)
+-            k_rope = tl.where(k_rope == k_rope, k_rope, zero_rope)
+-
+-            scores = tl.dot(q_nope, tl.trans(k_nope)) + tl.dot(
+-                q_rope,
+-                tl.trans(k_rope),
+-            )
+-            scores *= scale
++
++            k_comb = tl.where(nope_mask[None, :], k_nope, k_rope)
++            k_comb = tl.where(valid[:, None], k_comb, zero_comb)
++            k_comb = tl.where(k_comb == k_comb, k_comb, zero_comb)
++
++            scores = tl.dot(q_comb, tl.trans(k_comb)) * scale
+             scores = tl.where(head_mask[:, None] & valid[None, :], scores, neg_large)
+ 
+             m_block = tl.max(scores, axis=1)
+@@ -2196,8 +2198,7 @@
+             p = tl.where(head_mask[:, None] & valid[None, :], p, 0.0)
+             l_new = l_i * alpha + tl.sum(p, axis=1)
+ 
+-            acc_nope = acc_nope * alpha[:, None] + tl.dot(p.to(k_nope.dtype), k_nope)
+-            acc_rope = acc_rope * alpha[:, None] + tl.dot(p.to(k_rope.dtype), k_rope)
++            acc_comb = acc_comb * alpha[:, None] + tl.dot(p.to(k_comb.dtype), k_comb)
+             m_i = m_new
+             l_i = l_new
+ 
+@@ -2213,13 +2214,8 @@
+         + head_offsets[:, None] * pa_stride_h
+     )
+     tl.store(
+-        acc_base + nope_offsets[None, :],
+-        acc_nope,
+-        mask=head_mask[:, None] & nope_mask[None, :],
+-    )
+-    tl.store(
+-        acc_base + NOPE_DIM + rope_offsets[None, :],
+-        acc_rope,
++        acc_base + comb_offsets[None, :],
++        acc_comb,
+         mask=head_mask[:, None],
+     )
+ 
+@@ -2754,6 +2750,7 @@
+     attn_sink: torch.Tensor | None,
+     nope_head_dim: int,
+     rope_head_dim: int,
++    out: torch.Tensor | None = None,
+ ) -> torch.Tensor:
+     assert q.ndim == 3, f"expected q=[sq,h,d], got {q.shape}"
+     assert kv.ndim == 2, f"expected kv=[skv,d], got {kv.shape}"
+@@ -2784,7 +2781,8 @@
+     block_d = triton.next_power_of_2(head_dim)
+     block_k = _prefill_block_k(head_dim)
+     num_warps = 4
+-    out = torch.empty_like(q, dtype=torch.bfloat16)
++    if out is None:
++        out = torch.empty_like(q, dtype=torch.bfloat16)
+     _sparse_attn_prefill_ragged_kernel[(num_queries, triton.cdiv(num_heads, block_h))](
+         q,
+         kv,
+@@ -2822,6 +2820,7 @@
+     nope_head_dim: int,
+     rope_head_dim: int,
+     topk_length: torch.Tensor | None = None,
++    out: torch.Tensor | None = None,
+ ) -> torch.Tensor:
+     ragged_indices, ragged_indptr = build_ragged_indices_from_dense(
+         indices,
+@@ -2839,6 +2838,7 @@
+         attn_sink=attn_sink,
+         nope_head_dim=nope_head_dim,
+         rope_head_dim=rope_head_dim,
++        out=out,
+     )
+ 
+ 
+@@ -3316,10 +3316,9 @@
+             BLOCK_K=block_k,
+             NUM_SPLITS=num_splits,
+             NUM_STAGES=1,
+-            # 8 warps rather than 4: the [BLOCK_H, 512] fp32 accumulators spill
+-            # ~1.7 KB/thread at 4 warps. At batch 1 only ~16 CTAs exist, so
+-            # warps-per-CTA is the only occupancy lever available.
+-            num_warps=8,
++            # On SM80 (74 SMs), use 4 warps when base_workgroups >= 12 (B >= 6 at TP2)
++            # to enable 2 CTAs/SM (8 warps/SM) without spilling; use 8 warps at B < 6.
++            num_warps=4 if base_workgroups >= 12 else 8,
+         )
+ 
+     _sparse_attn_decode_reduce_kernel[(num_queries, num_heads)](
+@@ -3430,6 +3429,11 @@
+         rope_head_dim,
+         "rocm_sparse_attn_prefill",
+     )
++    direct_out = (
++        output
++        if (output.dtype == torch.bfloat16 and output.stride(-1) == 1)
++        else None
++    )
+     if ragged_indices is not None and ragged_indptr is not None:
+         output_chunk = _rocm_sparse_attn_prefill_ragged_triton(
+             q=q,
+@@ -3440,6 +3444,7 @@
+             attn_sink=None if attn_sink is None else attn_sink[: q.shape[1]],
+             nope_head_dim=nope_head_dim,
+             rope_head_dim=rope_head_dim,
++            out=direct_out,
+         )
+     else:
+         assert indices is not None
+@@ -3453,8 +3458,10 @@
+             nope_head_dim=nope_head_dim,
+             rope_head_dim=rope_head_dim,
+             topk_length=topk_length,
+-        )
+-    output.copy_(output_chunk.to(output.dtype))
++            out=direct_out,
++        )
++    if direct_out is None:
++        output.copy_(output_chunk.to(output.dtype))
+ 
+ 
+ def rocm_sparse_attn_decode(
+@@ -3507,7 +3514,13 @@
+         if topk_indices is not None:
+             extra_indices = topk_indices.reshape(topk_indices.shape[0], -1)
+ 
+-    direct_out = output if _ON_GFX950 and output.dtype == torch.bfloat16 else None
++    direct_out = (
++        output
++        if (_ON_GFX950 or current_platform.is_cuda())
++        and output.dtype == torch.bfloat16
++        and output.stride(-1) == 1
++        else None
++    )
+     attn_out = _rocm_sparse_attn_decode_triton(
+         q=q,
+         main_cache=swa_k_cache,
