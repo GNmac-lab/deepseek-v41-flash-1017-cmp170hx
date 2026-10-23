@@ -8,10 +8,13 @@ is the same on every card under TP4 (the latent is not split by head).
 
 | | 262,144 context | 1,048,576 context |
 |---|---:|---:|
-| Weights and runtime (non-torch) | 55.3 GiB | 55.3 GiB |
+| Weights and runtime (non-torch) | 54.3–54.5 GiB | 54.3–54.5 GiB |
 | Peak activation (2,048-token prefill chunk) + CUDA graphs | 2.5 + 1.2 GiB | ~0.7 GiB more (context-length workspaces) |
-| **KV cache** | **3.33 GiB = 1,574,996 tokens** | **2.6 GiB = 1,454,546 tokens** |
-| Full-length requests that fit | 6.0 | 1.39 |
+| **KV cache** | **3.23 GiB = 1,526,955 tokens** | **2.55 GiB = 1,426,183 tokens** |
+| Full-length requests that fit | 5.8 | 1.36 |
+
+1.0.0 had 3.33 GiB = 1,574,996 tokens at 262,144 context and 1,454,546 tokens at 1,048,576; 1.1.0 leaves about
+0.1 GiB less per card for the cache.
 
 Two changes in this recipe made room (both bit-identical in output):
 
@@ -24,12 +27,13 @@ Two changes in this recipe made room (both bit-identical in output):
 
 ## The 1M option
 
-`MAX_MODEL_LEN=1048576` in `.env`. Measured: needle retrieval passes at 388K (3/3 depths), 776K and 997K tokens;
+`MAX_MODEL_LEN=1048576` in `.env`. Measured on 1.0.0: needle retrieval passes at 388K (3/3 depths), 776K and
+997K tokens (1.1.0: 3/3 at 388K tokens);
 1-user decode −2 % and 8-stream throughput −6 % compared with 262K, because decode graphs size the indexer's top-K
 for the maximum context; cold prefill slows with context (1,399 tok/s at 170K; a 1M prompt takes ~25 min).
 
 ## Not possible here
 
 - Prefill chunks of 1,024 tokens (more KV room) do not start with images enabled: one image needs more than 1,024
-  tokens per step. 4,096-token chunks leave less KV and were slower.
+  tokens per step. 4,096-token chunks give ~4 % faster prefill but leave 848K tokens of KV instead of 1.53M.
 - A lower-precision KV cache would change the model's output; `fp8_ds_mla` is the model's native format.

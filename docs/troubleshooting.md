@@ -12,3 +12,6 @@
 | Prose is ~20 % slower right after a restart | Engram rows are read from disk until they are in the page cache | warm up with a few requests |
 | A very long prompt shows no log progress for minutes | the engine logs when it emits tokens; a 1M-token prefill takes ~25 min | wait; `nvidia-smi` shows the cards busy |
 | Two restarts give slightly different greedy text | TP4 decode is not bit-reproducible across processes (all-reduce timing, routing near-ties) | expected; compare quality with NLL, not text |
+| Requests with temperature > 0 decode slower than greedy ones | confidence-gated verification runs only for all-greedy batches; a batch with any sampled request verifies every draft | expected; the output is the same either way |
+| A worker stops at startup with `FileNotFoundError` under `dsv41_variants_d/` | a misspelled name in `DSV41_VARIANTS` | use names from `patches/dsv41_variants/variants/`, comma separated; empty = none |
+| A worker stops at startup with `dsv41_gate … self-test FAILED` | a variant checks its kernel against the stock one when it loads; a mismatch stops the worker instead of serving wrong output | report it with the log; `DSV41_VARIANTS=` (empty) starts without the variants |

@@ -29,11 +29,13 @@ RUN set -eu; \
 
 # ---------------------------------------------------------------------------------------------------------------
 # exllamav3 extension with the cooperative MoE decode kernel changes (branch-free tile, wide down tiles, parallel
-# epilogue, decoded weights as the MMA A operand). Built separately, as during development, then dropped in.
+# epilogue, decoded weights as the MMA A operand, per-expert widths, pointer-walk loads, row and lane clamps).
+# Built separately, as during development, then dropped in.
 FROM ${BASE} AS exl3ext
 COPY --from=src /src/exllamav3 /tmp/exllamav3
 COPY patches/patch_coop_branchfree.py patches/patch_coop_down_wide16.py patches/patch_coop_down_epilogue.py \
-     patches/patch_coop_mma_swap.py /tmp/
+     patches/patch_coop_mma_swap.py patches/patch_coop_widths.py patches/patch_coop_ptr.py patches/patch_coop_rowclamp.py \
+     patches/patch_coop_noclamp.py patches/patch_coop_laneclamp.py /tmp/
 ENV TORCH_CUDA_ARCH_LIST=8.0
 RUN set -eu; Q=/tmp/exllamav3/exllamav3/exllamav3_ext/quant; \
     cp -n /usr/local/lib/python3.12/dist-packages/nvidia/cu13/include/*.h /usr/local/cuda/include/; \
@@ -41,6 +43,11 @@ RUN set -eu; Q=/tmp/exllamav3/exllamav3/exllamav3_ext/quant; \
     python3 /tmp/patch_coop_down_wide16.py $Q/exl3_moe_coop_kernel.cuh $Q/exl3_moe_coop.cu; \
     python3 /tmp/patch_coop_down_epilogue.py $Q/exl3_moe_coop_kernel.cuh $Q/exl3_moe_coop.cu; \
     python3 /tmp/patch_coop_mma_swap.py $Q/exl3_moe_coop_kernel.cuh; \
+    python3 /tmp/patch_coop_widths.py /tmp/exllamav3/exllamav3/exllamav3_ext; \
+    python3 /tmp/patch_coop_ptr.py $Q/exl3_moe_coop_kernel.cuh; \
+    python3 /tmp/patch_coop_rowclamp.py $Q/exl3_moe_coop_kernel.cuh; \
+    python3 /tmp/patch_coop_noclamp.py $Q/exl3_moe_coop_kernel.cuh; \
+    python3 /tmp/patch_coop_laneclamp.py $Q/exl3_moe_coop_kernel.cuh; \
     cd /tmp/exllamav3 && MAX_JOBS=${MAX_JOBS:-16} python3 setup.py build_ext > /tmp/build_ext.log 2>&1 || { tail -40 /tmp/build_ext.log; exit 1; }; \
     find /tmp/exllamav3/build -name "exllamav3_ext*.so" -exec cp {} /tmp/exllamav3_ext.so \;; ls -la /tmp/exllamav3_ext.so
 
@@ -88,7 +95,7 @@ RUN --mount=type=bind,from=src,source=/src,target=/src set -eu; P=/opt/ds41-patc
 
 # 5. Engram row store, attention decode split-K, cooperative MoE kernel
 COPY --from=exl3ext /tmp/exllamav3_ext.so ${SP}/exllamav3_ext.cpython-312-x86_64-linux-gnu.so
-COPY --from=exl3ext /tmp/exllamav3/exllamav3/exllamav3_ext/quant/exl3_moe_coop_kernel.cuh /tmp/exllamav3/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cu ${SP}/exllamav3/exllamav3_ext/quant/
+COPY --from=exl3ext /tmp/exllamav3/exllamav3/exllamav3_ext/quant/exl3_moe_coop_kernel.cuh /tmp/exllamav3/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cu /tmp/exllamav3/exllamav3/exllamav3_ext/quant/exl3_moe_coop.cuh ${SP}/exllamav3/exllamav3_ext/quant/
 RUN set -eu; P=/opt/ds41-patches; \
     python3 $P/patch_attn_splitk.py ${SP}/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py; \
     python3 $P/patch_row_store_overlap.py ${SP}/engram_ssd/row_store.cpp; \
@@ -123,3 +130,38 @@ RUN set -eu; P=/opt/ds41-patches; \
     python3 $P/patch_true_ring.py ${SP}/flashinfer; \
     python3 $P/patch_wo_a_free.py ${SP}; \
     python3 $P/patch_long_ctx_mem.py ${SP}
+
+# 9. Decode speedups (1.1.0), in development order: draft-only FP8 head and router split-K knobs, greedy verification
+#    from the vocab-parallel argmax ids, the DSpark sampling loop as one CUDA graph, the fused Markov step
+RUN set -eu; P=/opt/ds41-patches; \
+    python3 $P/patch_v38.py ${SP} $P/dsv41_fp8_gemv.py; \
+    python3 $P/patch_greedy_ids.py ${SP}/vllm; \
+    python3 $P/patch_dspark_sample_graph.py ${SP}/hybrid/dspark_proposer.py; \
+    cp $P/dsv41_markov.py ${SP}/hybrid/dsv41_markov.py; \
+    python3 $P/patch_dspark_markov_fused.py ${SP}/hybrid/dspark_proposer.py; \
+    python3 -m py_compile ${SP}/hybrid/dspark_proposer.py ${SP}/hybrid/dsv41_markov.py ${SP}/hybrid/dsv41_fp8_gemv.py
+
+# 10. MXFP8 linears on one fragment-native weight copy (CUDA GEMV for M <= 8, smem-staged kernel for M <= 64,
+#     exact dequant + cuBLAS above) and the decode wo_a as one CUDA kernel with the inverse RoPE fused
+RUN set -eu; P=/opt/ds41-patches; \
+    for e in dsv41_fp8w dsv41_woa; do \
+      cp -r $P/$e /tmp/$e; cd /tmp/$e; MAX_JOBS=${MAX_JOBS:-16} python3 setup.py build_ext > /tmp/$e.log 2>&1 || { tail -40 /tmp/$e.log; exit 1; }; \
+      find /tmp/$e/build -name "${e}_ext*.so" -exec cp {} ${SP}/ \;; cd /; rm -rf /tmp/$e; \
+    done; \
+    python3 $P/patch_fp8_gemv_cuda.py ${SP}; \
+    python3 $P/patch_wo_a_cuda.py ${SP}; \
+    python3 -c "import torch, dsv41_fp8w_ext, dsv41_woa_ext; print('dsv41_fp8w_ext, dsv41_woa_ext ok')"
+
+# 11. Router GEMM before the shared experts, sm80 sparse-MLA decode launch (BLOCK_K 16, 8 warps), gemm_mid table
+RUN set -eu; P=/opt/ds41-patches; \
+    python3 $P/patch_gate_first.py ${SP}; \
+    python3 $P/patch_attn_cfg.py ${SP}/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py; \
+    python3 $P/patch_mid_table.py ${SP}; \
+    python3 -m py_compile ${SP}/vllm/model_executor/layers/fused_moe/runner/moe_runner.py \
+      ${SP}/vllm/v1/attention/ops/rocm_aiter_mla_sparse.py ${SP}/vllm/model_executor/kernels/linear/mxfp8/dsv41_fp8w.py
+
+# 12. Runtime variants applied before graph capture (DSV41_VARIANTS; empty = none): one-launch decode metadata,
+#     repeated-H2D skips, and confidence-gated verification (DSV41_GATE_TAU, 0 = off)
+RUN set -eu; P=/opt/ds41-patches; \
+    python3 $P/dsv41_variants/patch_variants.py ${SP}/vllm $P/dsv41_variants; \
+    python3 -m py_compile ${SP}/vllm/dsv41_variants.py ${SP}/vllm/v1/worker/gpu_worker.py ${SP}/vllm/dsv41_variants_d/*.py

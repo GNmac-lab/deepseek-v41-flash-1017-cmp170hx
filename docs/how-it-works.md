@@ -8,18 +8,27 @@
 | sm_80 model support | sparse MLA attention on Ampere, PP shadow KV, DSpark drafter (V1), Engram row store read from NVMe | zebgop-ops/dsv41reap-pp, kaka86mm |
 | Weights | hybrid checkpoint: LibertAI EXL3 2.9-bpw routed experts (layers 0–39) + the official FP8 release for everything else (attention, shared experts, head, drafter, Engram) | Curtis White's recipe |
 | Routed experts | EXL3 kernels: a cooperative decode kernel for small batches, tensor-core kernels for prefill and large batches | exllamav3, vllm-exl3, DeepSeekv41-Flash-EXL3-TC-MoE |
+| Dense FP8 layers | this recipe's MXFP8 CUDA kernels on one weight copy for up to 64 tokens; Marlin or exact dequant + cuBLAS above | this recipe, Marlin |
 | Parallelism | TP4 with async scheduling and full CUDA graphs for decode; FlashInfer PCIe IPC all-reduce | FlashInfer |
-| Speculation | DSpark, 5 drafted tokens per step (the drafter's block size; 6 and 7 do not start) | DeepSeek, zebgop-ops |
+| Speculation | DSpark, 5 drafted tokens per step (the drafter's block size; 6 and 7 do not start); its confidence head decides how many drafts are verified | DeepSeek, zebgop-ops |
 
-A decode step at one user verifies 6 rows (5 drafts + 1). Its time splits roughly into the routed-expert MoE
-(~35 %), the two all-reduces per layer (~25 %, at the PCIe 2.0 x16 limit since the ring variant), attention and
-the shared experts, and a few hundred small kernels.
+A decode step at one user verifies 6 rows (5 drafts + 1). In 1.1.0 a 1-user prose step with all 6 rows verified
+takes ~18.4 ms: 15.9 ms for the target's forward graph, 1.5 ms for the DSpark drafter (vLLM runs drafters in
+PIECEWISE graphs), 0.36 ms for the LM head and verification, and ~0.5 ms for input preparation and attention
+metadata. The GPUs are never waiting for the CPU. Inside the forward graph, the routed-expert MoE and the two
+all-reduces per layer (at the PCIe 2.0 x16 limit since the ring variant) are the largest parts.
+
+The routed experts of one token cost ~4 ms per step (~96 µs per layer: six experts are too few blocks to fill the
+card). Each further token in the step costs another 0.6–1.0 ms. This is why skipping drafts that will be rejected
+pays (see "Confidence-gated verification" below).
 
 ## What this recipe changes
 
 Every row was measured on its own (structured decode step time is the cleanest A/B: restart noise is 0.1–0.2 ms)
 and checked for output changes with a paired NLL evaluation (411 short passages); "bit-identical" means every
 passage's NLL matched exactly.
+
+### 1.0.0
 
 | Patch | Change | Effect | Output |
 |---|---|---|---|
@@ -44,12 +53,50 @@ passage's NLL matched exactly.
 | `patch_wo_a_free.py` | `wo_a` kept only as FP8 codes; prefill rebuilds the exact bf16 weight in one scratch buffer | +0.9 GiB per card for the KV cache | bit-identical |
 | `patch_long_ctx_mem.py` | context-length workspaces sized for this deployment | KV pool 947K → 1,575K tokens; 1M context fits | bit-identical |
 
-"Sum order" changes the order in which the four ranks' partial sums are added (the same kind of change as
-switching all-reduce libraries); the paired evaluation stayed within noise.
+### 1.1.0
+
+Structured step times are for 1 user on the development build, in the order the changes went in (1.0.0: 20.1 ms).
+
+| Patch | Change | Effect | Output |
+|---|---|---|---|
+| `patch_v38.py` (`DSV41_DRAFT_HEAD_FP8=1`) | draft-only FP8 copy of the drafter's head shard | step −0.1–0.2 ms | identical (the target verifies with its bf16 head) |
+| `patch_greedy_ids.py` | greedy verification from the vocab-parallel argmax ids, without two full-vocab argmax passes | with the next two rows | identical |
+| `patch_dspark_sample_graph.py` | the sharded DSpark Markov sampling loop (~70 eager kernels) as one CUDA graph per batch size | | identical drafts |
+| `dsv41_markov.py`, `patch_dspark_markov_fused.py` | Markov bias GEMV + bf16 add + shard max in two Triton kernels | 16 vs 44 µs per draft position; 20.1 → 19.62 ms for the three rows | bit-identical |
+| `patch_coop_ptr.py`, `patch_coop_rowclamp.py`, `patch_coop_noclamp.py`, `patch_coop_laneclamp.py` | coop MoE loops: pointer-walk loads, padding rows load a real row instead of a predicated zero-fill, no prefetch clamp in the steady state, 3-bpw lanes 24–31 reuse lane 23's word | 7.33 → 6.39 instructions per weight; 19.62 → 19.06 ms | bit-identical |
+| `patch_fp8_gemv_cuda.py`, `dsv41_fp8w.py`, `dsv41_fp8w/` | MXFP8 linears (attention, shared experts, indexer, drafter) on one weight copy in a fragment-native layout: a GEMV for M ≤ 8, a kernel with shared-memory-staged activations for M ≤ 64, exact dequant + cuBLAS above; weights over 32 MB stay on Marlin | 19.06 → 18.37 ms | sum order (NLL +0.24 %, 0.35 σ) |
+| `patch_wo_a_cuda.py`, `dsv41_woa/` | decode `wo_a` (M ≤ 8) as one CUDA kernel on the exact FP8 codes, inverse RoPE fused into its activation load | 18.37 → 18.07 ms | sum order |
+| `patch_gate_first.py` | the router GEMM is launched before the shared experts go to the aux stream | 18.07 → 17.95 ms | bit-identical |
+| `patch_attn_cfg.py`, `patch_mid_table.py` | sm_80 sparse-MLA decode partial kernel: 16 KV tokens per step on 8 warps (was 32 on 4); a config table for every served shape of the M ≤ 64 MXFP8 kernel | 17.95 → 17.64 ms | sum order |
+| `dsv41_variants/` `dsv41_topk_meta`, `dsv41_h2d_lean`, `dsv41_ragged_lean` | decode top-k and ragged-index metadata in one launch each; no host-to-device copy for index tensors and block-table rows that repeat the previous step | 17.64 → 17.43 ms | bit-identical |
+| `dsv41_variants/` `dsv41_gate` | confidence-gated verification (below) | prose 1 user +3 %, 8 users +5 % | identical tokens |
+
+"Sum order" changes the order in which partial sums are added: the four ranks' partial sums for the all-reduce,
+and fp32 partial sums inside a kernel for the 1.1.0 rows. The paired evaluation stayed within noise for each one.
+The validation mode `DSV41_FP8_GEMV_ALL=1 DSV41_WO_A_ALL=1` sends every prompt token through the decode-only kernels
+(8 rows at a time), so the prefill-scored NLL evaluation covers them too: −0.47 % vs 1.0.0 (1.3 σ).
+
+## Confidence-gated verification
+
+DSpark proposes 5 drafts per step, but in prose most of the later ones are rejected (acceptance by position:
+82 / 58 / 40 / 29 / 20 %). The drafter has a trained confidence head. `dsv41_gate` keeps drafts while the running
+product of their confidences stays at or above `DSV41_GATE_TAU` (default 0.10). For each draft after that:
+
+- the router gives the draft's token the expert-id sentinel, so the MoE kernels skip it and never load its experts;
+- the rejection sampler replaces the draft with an id that can never match, so it is rejected.
+
+Accepted tokens and the correction token always come from positions whose experts did run, and with causal
+attention no earlier position depends on a skipped one. The output is therefore the token sequence the ungated
+model gives. Graph shapes and async scheduling do not change; skipped drafts behave like rejected ones.
+
+Only steps in which every request verifies exactly 1 + 5 tokens, run as a FULL CUDA graph with greedy sampling, are
+gated. Prefill chunks, draft-less steps, PP4 (PIECEWISE graphs) and any batch with a sampled (temperature > 0)
+request run with nothing skipped. Sampled requests therefore get no gain from the gate.
 
 ## What did not help
 
 See [tuning-log.md](tuning-log.md) for the full list with numbers. In short: a host-memory all-reduce (loses above
-~10 KB), an FP8 GEMV for the Marlin layers (ties Marlin once weights come from HBM), drafter top-k truncation and
-adaptive verification (acceptance losses cancel the savings), a different EXL3 expert pack (same speed, +1.55 %
-NLL), larger prefill chunks (smaller KV pool and slower), folding the inverse RoPE into the `wo_a` kernel (+0.8 ms).
+~10 KB), drafter top-k truncation, an earlier adaptive verification that zeroed the routing weights of unlikely drafts
+(step −0.7 ms, no gain in MiaAI), a different EXL3 expert pack (same speed, +1.55 % NLL), larger prefill
+chunks (smaller KV pool), coop split-K, a persistent coop kernel, the whole drafter as one CUDA graph, skipping
+attention for gated drafts, and vLLM's dual-batch overlap for prefill (it needs data parallelism).

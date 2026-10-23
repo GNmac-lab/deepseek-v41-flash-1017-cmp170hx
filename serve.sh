@@ -43,9 +43,15 @@ COMMON_ENV=(
   -e DSV41_ENGRAM_STORAGE=ssd -e DSV41_ENGRAM_DIR="$ENGRAM"
   -e DSV41_EXPERTS_ONLY_FILES_RE='^model-[0-9]+-of-000(43|39)\.safetensors$'
   -e TORCH_CUDA_ARCH_LIST=8.0 -e TORCHINDUCTOR_CACHE_DIR=/root/.cache/inductor
-  -e VLLM_DSV41_DECODE_SPLITK=1 -e DSV41_SHARED_HEAVY_BLOCKS=1
+  -e VLLM_DSV41_DECODE_SPLITK=1 -e DSV41_SHARED_HEAVY_BLOCKS=1 -e DSV41_DRAFT_HEAD_FP8=1
   -e DSV41_PREFILL_CHUNK_REQS=1 -e DSV41_INDEXER_BUF_MULT=4
 )
+# Optional engine knobs, passed only when set in .env: DSV41_VARIANTS (runtime variant list; empty = none),
+# DSV41_GATE_TAU (confidence-gated verification threshold; 0 = off)
+OPT_ENV=()
+for v in DSV41_VARIANTS DSV41_GATE_TAU; do
+  if [ -n "${!v+x}" ]; then OPT_ENV+=(-e "$v=${!v}"); fi
+done
 case "$LAYOUT" in
   tp4)
     PAR=(--tensor-parallel-size 4 --pipeline-parallel-size 1)
@@ -69,7 +75,7 @@ docker run -d --name "$NAME" --gpus all --ipc=host --cap-add SYS_NICE \
   -v "$MODELS_DIR:/models:ro" \
   -v "$CACHE_DIR/root-cache:/root/.cache" -v "$CACHE_DIR/triton:/root/.triton" -v "$CACHE_DIR/tilelang:/root/.tilelang" \
   -p "$BIND:$PORT:$PORT" \
-  "${COMMON_ENV[@]}" "${LAYOUT_ENV[@]}" \
+  "${COMMON_ENV[@]}" "${LAYOUT_ENV[@]}" "${OPT_ENV[@]}" \
   --entrypoint vllm "$IMAGE" serve "$MODEL" \
   --quantization exl3 --load-format safetensors --safetensors-load-strategy lazy \
   "${PAR[@]}" \

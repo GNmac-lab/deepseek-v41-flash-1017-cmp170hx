@@ -13,12 +13,25 @@ import os
 import re
 import subprocess
 import tempfile
+import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 SETS = {"humaneval": ("openai/openai_humaneval", "openai_humaneval", "test", 4096),
         "gsm8k": ("openai/gsm8k", "main", "test", 3072)}
+
+
+def fetch_json(url, tries=6):
+    """GET a JSON page; the datasets server sometimes answers 5xx or times out, so retry with backoff."""
+    for i in range(tries):
+        try:
+            return json.load(urllib.request.urlopen(url, timeout=120))
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as e:
+            if i == tries - 1 or (isinstance(e, urllib.error.HTTPError) and e.code < 500 and e.code != 429):
+                raise
+            time.sleep(5 * 2 ** i)
 
 
 def rows(dataset, config, split):
@@ -29,7 +42,7 @@ def rows(dataset, config, split):
     while True:
         url = (f"https://datasets-server.huggingface.co/rows?dataset={dataset}&config={config}&split={split}"
                f"&offset={off}&length=100")
-        page = json.load(urllib.request.urlopen(url, timeout=120))
+        page = fetch_json(url)
         out += [r["row"] for r in page["rows"]]
         off += len(page["rows"])
         if not page["rows"] or off >= page["num_rows_total"]:

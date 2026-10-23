@@ -59,25 +59,31 @@ it quantized, which this recipe takes from the official FP8 release instead). Di
 (the experts are spread across all of them), 18 GB of official non-expert tensors fetched by range requests, 190 GB
 of Engram tables.
 
-## Headline numbers
+## Benchmark numbers
 
-Measured 2026-10-21 on 4× CMP 170HX (74 SMs, PCIe 2.0 x16, P2P on, 180 W per card), with the model's 189 GiB Engram
-n-gram tables streamed from NVMe on demand (not loaded into GPU or host memory), 262,144-token context, defaults from
-`.env.example`. Decode follows the MiaAI-Lab protocol (see [docs/results.md](docs/results.md)): temperature 0,
-thinking off, 400-token cap; 1 user = median of 5 streaming runs, 2/4/8 users = median of 3 aggregate runs.
+Release 1.1.0, measured 2026-10-22 on 4× CMP 170HX (74 SMs, PCIe 2.0 x16, P2P on, 180 W per card), with the
+model's 189 GiB Engram n-gram tables streamed from NVMe on demand (not loaded into GPU or host memory),
+262,144-token context, defaults from `.env.example`; 1.0.0 on the same host. Decode follows the MiaAI-Lab protocol
+(see [docs/results.md](docs/results.md)): temperature 0, thinking off, 400-token cap; 1 user = median of 5 streaming
+runs, 2/4/8 users = median of 3 aggregate runs. TP4 1.1.0 values are the median of 5 such passes on one boot (prose
+varies ±3–4 % between passes); the other columns are one pass.
 
-| | TP4 (default), P2P on | PP4 |
-|---|---:|---:|
-| 1 user, structured / code / prose (tok/s) | **296 / 212 / 150** | **111 / 81 / 52** |
-| 2 users, aggregate | 391 / 216 / 208 | 112 / 75 / 54 |
-| 4 users, aggregate | 572 / 336 / 277 | 195 / 133 / 102 |
-| 8 users, aggregate | 796 / 477 / 359 | 320 / 188 / 144 |
-| Cold prefill (median of 9, ~24-38K-token prompts) | 1,759 tok/s | 2,375 tok/s |
-| KV pool at 262,144 context | 1,574,996 tokens (6.0 full-length requests) | 2,539,313 tokens (9.7 full-length requests) |
+| tok/s, structured / code / prose | TP4 1.1.0 | TP4 1.0.0 | change | PP4 1.1.0 | PP4 1.0.0 | change |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 user | **336 / 247 / 180** | 296 / 212 / 150 | +14 / +16 / +20 % | **118 / 92 / 64** | 111 / 81 / 52 | +7 / +14 / +23 % |
+| 2 users, aggregate | 419 / 238 / 228 | 391 / 216 / 208 | +7 / +10 / +10 % | 121 / 84 / 65 | 112 / 75 / 54 | +8 / +11 / +21 % |
+| 4 users, aggregate | 602 / 368 / 308 | 572 / 336 / 277 | +5 / +9 / +11 % | 209 / 145 / 115 | 195 / 133 / 102 | +7 / +9 / +12 % |
+| 8 users, aggregate | 813 / 505 / 385 | 796 / 477 / 359 | +2 / +6 / +7 % | 341 / 215 / 161 | 320 / 188 / 144 | +6 / +15 / +12 % |
+| Cold prefill (median of 9, ~24-38K-token prompts) | 1,764 | 1,759 | +0.3 % | 2,457 | 2,375 | +3 % |
+| KV pool at 262,144 context (tokens) | 1,526,955 | 1,574,996 | −3 % | 2,539,313 | 2,539,313 | 0 % |
 
-Decode rates are rounded to whole tok/s; exact values are in [docs/results.md](docs/results.md).
+Decode rates are rounded to whole tok/s and the changes are computed from the exact values in
+[docs/results.md](docs/results.md). The KV pools hold 5.8 (TP4) and 9.7 (PP4) full-length requests. The gain is in
+decode: 1.1.0 adds CUDA kernels for the FP8 layers, tighter MoE decode loops, less per-step overhead, and
+confidence-gated verification, which skips the experts of drafts that the drafter itself expects to be rejected,
+without changing the output.
 
-Quality (TP4): HumanEval 156/164, GSM8K 1,275/1,319, scored on the answer after the reasoning. PP4 was measured on
+Quality (TP4): HumanEval 156/164, GSM8K 1,273/1,319, scored on the answer after the reasoning. PP4 was measured on
 the same x16 host; on x4 links its decode should change little (activations only) while TP4 would slow down sharply.
 
 ## Settings
@@ -87,10 +93,12 @@ All in `.env` (defaults in `.env.example`):
 | Setting | Default | |
 |---|---|---|
 | `LAYOUT` | `tp4` | `tp4` or `pp4` (see below) |
-| `MAX_MODEL_LEN` | `262144` | up to `1048576`, the model's native context (KV pool 1,454,546 tokens; 1-user decode −2 %, 8 users −6 %) |
+| `MAX_MODEL_LEN` | `262144` | up to `1048576`, the model's native context (KV pool 1,426,183 tokens; slightly slower decode) |
 | `MAX_NUM_SEQS` | `8` | concurrent requests |
 | `GPU_MEMORY_UTILIZATION` | `0.95` | |
 | `P2P` | `1` | `0` sends NCCL traffic through host memory |
+| `DSV41_GATE_TAU` | `0.10` | confidence-gated verification threshold; `0` verifies every draft (same output, slower) |
+| `DSV41_VARIANTS` | all four | runtime variants applied before CUDA graph capture; empty = none |
 | `BIND`, `PORT` | `127.0.0.1`, `8000` | where the API is published |
 
 ## Choosing a layout
