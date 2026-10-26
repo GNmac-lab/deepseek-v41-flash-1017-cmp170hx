@@ -82,3 +82,19 @@ Structured / prose step times against the build of the time.
 | 4,096-token prefill chunks (again) | prefill +4 %, but the KV pool falls 1.53M → 848K tokens |
 | Row-parallel Engram `wkv` + all-reduce | the PCIe all-gather costs more than the GEMV it saves |
 | L2 prefetch of FP8 weights in idle windows; CPU C-states off + performance governor | no gain |
+
+## Tried and dropped for 1.2.0
+
+| Idea | Result |
+|---|---|
+| PIECEWISE CUDA graphs for prefill steps up to 256 tokens | time to first token 121 → 68 ms, code at 2 users +18 %; but 2 of 30 batched 8-prompt prefills with prompt logprobs failed beside an 8-stream decode load (eager: 0 of 30); kept eager |
+| 4,096-token prefill chunks with the 1.2.0 prefill pipeline | ~+1 %, and the cold prefill bench ran out of memory |
+| A fixed verify width of 4 or 3 drafts | 4 never won; 3 won prose at 2+ users and lost structured and code, hence the acceptance-aware choice |
+| `SPEC_TOKENS=3` or `4` (narrower drafter blocks) | boots, but every request fails (the gate assumes 5 drafts) |
+| Morrowmake's MoE fold on the decode kernel | bitwise equal, 13–18 % slower (the fold stages spill to a 504-byte stack frame) |
+| Morrowmake's `moe_prefill_v2` (512-row chunks) | slower than the 1.1.0 prefill kernel |
+| NCCL all-reduce beside prefill compute; the copy-engine ring with Triton flag kernels | no gain (NCCL's kernels hold SMs) / slower (each flag kernel waits for an SM) |
+| An IPC all-gather with P2P stores (Engram heads, draft sampling) | slower than NCCL LL inside graphs (19 vs 16 µs tiny, 77 vs 35 µs at 6 × 6 × 256): concurrent P2P writes collapse on these links |
+| A faster drafter | 1.38 ms per step, 92 % busy, no kernel above 0.17 ms |
+| Engram all-gather on a side stream; gate τ 0.03–0.20; retuned mHC decode tiles | no gain |
+

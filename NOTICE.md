@@ -4,8 +4,12 @@ This recipe's own scripts, patches and documents are MIT-licensed (see [LICENSE]
 [`patches/vllm-exl3/`](patches/vllm-exl3/). Those modify vcruz305/vllm-exl3, which is AGPL-3.0-only, so they carry
 AGPL-3.0-only too (SPDX headers, licence text in that folder).
 
-The engine image is built from the projects below at the commits shown. None of their source is stored in this
-repository: `docker/Dockerfile` fetches each one at build time. The image you build therefore contains
+The engine image is built from the projects below at the commits shown. `docker/Dockerfile` fetches each one at
+build time, with two exceptions: [`patches/tc_moe_try/`](patches/tc_moe_try/) and
+[`patches/tc_moe_v2try/`](patches/tc_moe_v2try/) hold modified copies of Apache-2.0 tensor-core MoE kernels from
+Morrowmake/vllm-cmp170hx (licence text, origin and changes in each folder), and they stay Apache-2.0.
+[`patches/dsv41_variants/variants/dsv41_ce_ring.py`](patches/dsv41_variants/variants/dsv41_ce_ring.py) is a port of
+that project's copy-engine all-reduce and is Apache-2.0 as well. The image you build therefore contains
 AGPL-3.0-only code (vllm-exl3 with this recipe's changes). If you let other people use a server built from it over
 a network, AGPL-3.0 section 13 requires you to offer them the corresponding source: this repository plus the
 upstream commits below.
@@ -20,6 +24,7 @@ upstream commits below.
 | [CurtisAccelerate/DeepSeekv41-Flash-EXL3-TC-MoE](https://github.com/CurtisAccelerate/DeepSeekv41-Flash-EXL3-TC-MoE) | `88eb6e1` | Apache-2.0 | tensor-core EXL3 MoE (prefill and large batches) | no |
 | [flashinfer-ai/flashinfer](https://github.com/flashinfer-ai/flashinfer) | `v0.7.0.post1` (`946200d`) | Apache-2.0 | PCIe IPC all-reduce, vendored into the image's FlashInfer 0.6.18 | yes: a neighbour-ring variant |
 | [HalfVulpes/Deepinfer-SM80](https://github.com/HalfVulpes/Deepinfer-SM80) | `2a828fc` | Apache-2.0 | sm_80 sparse-attention decode and top-K combiner | `patches/deepinfer_sm80_*.patch` are adapted from its patches |
+| [Morrowmake/vllm-cmp170hx](https://github.com/Morrowmake/vllm-cmp170hx) | `a0c57b5` | Apache-2.0 | tensor-core EXL3 MoE schedules for prefill (`moe_prefill_try`) and decode (`moe_v2_try`), the copy-engine all-reduce; the split prefill all-reduce and load-adaptive verify width designs | yes: the kernels instantiated for the tensor-parallel expert shapes, the all-reduce as an owner sum on stream memory operations |
 
 **Not redistributed, downloaded by `tools/download.sh`:**
 

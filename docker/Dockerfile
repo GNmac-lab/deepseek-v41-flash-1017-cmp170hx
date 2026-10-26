@@ -165,3 +165,18 @@ RUN set -eu; P=/opt/ds41-patches; \
 RUN set -eu; P=/opt/ds41-patches; \
     python3 $P/dsv41_variants/patch_variants.py ${SP}/vllm $P/dsv41_variants; \
     python3 -m py_compile ${SP}/vllm/dsv41_variants.py ${SP}/vllm/v1/worker/gpu_worker.py ${SP}/vllm/dsv41_variants_d/*.py
+
+# 13. Prefill and decode (1.2.0), in development order: prefill TP sums beside compute on a copy-engine owner sum
+#     (dsv41_ce_ring, dsv41_split_reduce), Morrowmake's prefill and decode tensor-core MoE schedules built for the TP
+#     expert shapes (dsv41_moe_try, dsv41_moe_v2try), Engram row prefetch, prefill tiles for the fused mHC kernel,
+#     packed sparse-attention prefill gathers, prefill attention micro-batches (dsv41_attn_slices; the variant list
+#     is in patches/dsv41_variants/dsv41_variants.py), and the per-step DSpark verify width (DSV41_DYNK)
+RUN set -eu; P=/opt/ds41-patches; \
+    python3 $P/tc_moe_try/build_try.py --out /opt/dsv41-tc-moe --build-dir /tmp/trybuild; \
+    python3 $P/tc_moe_v2try/build_v2try.py --out /opt/dsv41-tc-moe --build-dir /tmp/v2trybuild; \
+    rm -rf /tmp/trybuild /tmp/v2trybuild; \
+    cp -r $P/tc_moe_try /opt/dsv41-tc-moe-src/moe_prefill_try; cp -r $P/tc_moe_v2try /opt/dsv41-tc-moe-src/moe_v2_try; \
+    cp $P/dsv41_dynk.py ${SP}/hybrid/dsv41_dynk.py; \
+    python3 $P/patch_dynk.py; \
+    python3 -m py_compile ${SP}/hybrid/dsv41_dynk.py ${SP}/hybrid/dspark_proposer.py ${SP}/vllm/v1/core/sched/scheduler.py; \
+    test -s /opt/dsv41-tc-moe/_dsv41_mm_try.abi3.so; test -s /opt/dsv41-tc-moe/_dsv41_mm_v2try.abi3.so

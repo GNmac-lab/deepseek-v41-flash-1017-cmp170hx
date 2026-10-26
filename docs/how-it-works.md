@@ -7,10 +7,10 @@
 | Base | vLLM, official DeepSeek-V4.1 image | vllm-project |
 | sm_80 model support | sparse MLA attention on Ampere, PP shadow KV, DSpark drafter (V1), Engram row store read from NVMe | zebgop-ops/dsv41reap-pp, kaka86mm |
 | Weights | hybrid checkpoint: LibertAI EXL3 2.9-bpw routed experts (layers 0–39) + the official FP8 release for everything else (attention, shared experts, head, drafter, Engram) | Curtis White's recipe |
-| Routed experts | EXL3 kernels: a cooperative decode kernel for small batches, tensor-core kernels for prefill and large batches | exllamav3, vllm-exl3, DeepSeekv41-Flash-EXL3-TC-MoE |
+| Routed experts | EXL3 kernels: tensor-core kernels for decode (1–64 rows, Morrowmake's lane-GEMM schedule) and prefill (Morrowmake's second schedule); the cooperative kernel for PP4 decode | exllamav3, vllm-exl3, DeepSeekv41-Flash-EXL3-TC-MoE, Morrowmake |
 | Dense FP8 layers | this recipe's MXFP8 CUDA kernels on one weight copy for up to 64 tokens; Marlin or exact dequant + cuBLAS above | this recipe, Marlin |
 | Parallelism | TP4 with async scheduling and full CUDA graphs for decode; FlashInfer PCIe IPC all-reduce | FlashInfer |
-| Speculation | DSpark, 5 drafted tokens per step (the drafter's block size; 6 and 7 do not start); its confidence head decides how many drafts are verified | DeepSeek, zebgop-ops |
+| Speculation | DSpark, 5 drafted tokens per step (the drafter's block size; 6 and 7 do not start); per step 3 or 5 of them are verified (TP4), and its confidence head decides which verified drafts run their experts | DeepSeek, zebgop-ops, Morrowmake (verify width) |
 
 A decode step at one user verifies 6 rows (5 drafts + 1). In 1.1.0 a 1-user prose step with all 6 rows verified
 takes ~18.4 ms: 15.9 ms for the target's forward graph, 1.5 ms for the DSpark drafter (vLLM runs drafters in
@@ -76,6 +76,26 @@ and fp32 partial sums inside a kernel for the 1.1.0 rows. The paired evaluation 
 The validation mode `DSV41_FP8_GEMV_ALL=1 DSV41_WO_A_ALL=1` sends every prompt token through the decode-only kernels
 (8 rows at a time), so the prefill-scored NLL evaluation covers them too: −0.47 % vs 1.0.0 (1.3 σ).
 
+### 1.2.0
+
+Prefill numbers are the development build's warm 16K-token prefill and the cold bench of `bench/prefill.py`; decode
+numbers are MiaAI passes on one boot.
+
+| Patch | Change | Effect | Output |
+|---|---|---|---|
+| `dsv41_variants/` `dsv41_split_reduce`, `dsv41_ce_ring` | prefill layer after the attention core in row slices; the TP sums on a side stream as a copy-engine owner sum | cold 1,784 → ~1,960 | fp32 sum, rounded once |
+| `dsv41_moe_try` (`patches/tc_moe_try/`) | Morrowmake's second prefill MoE schedule at the TP expert shapes | 1,024 rows 6.86 → 5.26 ms; warm 1,956 → 2,250 (with fused mHC in the slices) | bitwise equal |
+| `dsv41_engram_prefetch` | Engram rows of the next two chunks read ahead into the page cache | fresh 12K text 2,053 → 2,187 | bit-identical |
+| `dsv41_mhc_pcfg` | prefill-sized tiles for the fused mHC kernel from 256 rows | warm 2,333 → 2,375 | sum order |
+| `dsv41_prefill_pack` | sparse-attention prefill gathers packed by real width | 8-user time to first token −10 % | single request bit-identical |
+| `dsv41_attn_slices` + the pipelined `dsv41_split_reduce` | prefill attention per slice (per-slice metadata); a layer returns before its last FFN sums land | warm ~2,630, cold 2,167 → 2,446 | NLL +0.10 % (48 × 2,000 tokens) |
+| `dsv41_moe_v2try` (`patches/tc_moe_v2try/`) | Morrowmake's lane-GEMM decode MoE at the TP expert shapes, for 1–64 rows | 1 user 333.5 / 244.2 / 181.4 → 358.3 / 268.1 / 194.1 | bitwise equal to the 1.1.0 tensor-core kernel |
+| `dsv41_dynk.py`, `patch_dynk.py` (`DSV41_DYNK=accept:3,5`) | per-step verify width, 3 or 5 drafts, from per-request acceptance and step costs | prose 2 / 4 / 8 users 232 → 248, 306 → 349, 420 → 445 | same accepted tokens; batch shape differs |
+
+Prefill layers without an indexer reuse the top-k rows the last indexer layer wrote. Per-slice attention keeps each
+slice's rows and restores them before those layers. Without that, a slice read the next slice's selections (future
+tokens): on a random 1,000-token sequence repeated once, the first copy's NLL fell 12 % below its causal 13.0.
+
 ## Confidence-gated verification
 
 DSpark proposes 5 drafts per step, but in prose most of the later ones are rejected (acceptance by position:
@@ -90,8 +110,8 @@ attention no earlier position depends on a skipped one. The output is therefore 
 model gives. Graph shapes and async scheduling do not change; skipped drafts behave like rejected ones.
 
 Only steps in which every request verifies exactly 1 + 5 tokens, run as a FULL CUDA graph with greedy sampling, are
-gated. Prefill chunks, draft-less steps, PP4 (PIECEWISE graphs) and any batch with a sampled (temperature > 0)
-request run with nothing skipped. Sampled requests therefore get no gain from the gate.
+gated (a 3-draft step from the verify width is not gated). Prefill chunks, draft-less steps, PP4 (PIECEWISE graphs) and
+any batch with a sampled (temperature > 0) request run with nothing skipped. Sampled requests therefore get no gain from the gate.
 
 ## What did not help
 

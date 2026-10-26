@@ -61,30 +61,34 @@ of Engram tables.
 
 ## Benchmark numbers
 
-Release 1.1.0, measured 2026-10-22 on 4× CMP 170HX (74 SMs, PCIe 2.0 x16, P2P on, 180 W per card), with the
+Release 1.2.0, measured 2026-10-26 on 4× CMP 170HX (74 SMs, PCIe 2.0 x16, P2P on, 180 W per card), with the
 model's 189 GiB Engram n-gram tables streamed from NVMe on demand (not loaded into GPU or host memory),
-262,144-token context, defaults from `.env.example`; 1.0.0 on the same host. Decode follows the MiaAI-Lab protocol
+262,144-token context, defaults from `.env.example`; 1.1.0 on the same host. Decode follows the MiaAI-Lab protocol
 (see [docs/results.md](docs/results.md)): temperature 0, thinking off, 400-token cap; 1 user = median of 5 streaming
-runs, 2/4/8 users = median of 3 aggregate runs. TP4 1.1.0 values are the median of 5 such passes on one boot (prose
-varies ±3–4 % between passes); the other columns are one pass.
+runs, 2/4/8 users = median of 3 aggregate runs. TP4 values are the median of 5 such passes on one boot (prose
+varies ±3–4 % between passes); the PP4 columns are one pass.
 
-| tok/s, structured / code / prose | TP4 1.1.0 | TP4 1.0.0 | change | PP4 1.1.0 | PP4 1.0.0 | change |
+| tok/s, structured / code / prose | TP4 1.2.0 | TP4 1.1.0 | change | PP4 1.2.0 | PP4 1.1.0 | change |
 |---|---:|---:|---:|---:|---:|---:|
-| 1 user | **336 / 247 / 180** | 296 / 212 / 150 | +14 / +16 / +20 % | **118 / 92 / 64** | 111 / 81 / 52 | +7 / +14 / +23 % |
-| 2 users, aggregate | 419 / 238 / 228 | 391 / 216 / 208 | +7 / +10 / +10 % | 121 / 84 / 65 | 112 / 75 / 54 | +8 / +11 / +21 % |
-| 4 users, aggregate | 602 / 368 / 308 | 572 / 336 / 277 | +5 / +9 / +11 % | 209 / 145 / 115 | 195 / 133 / 102 | +7 / +9 / +12 % |
-| 8 users, aggregate | 813 / 505 / 385 | 796 / 477 / 359 | +2 / +6 / +7 % | 341 / 215 / 161 | 320 / 188 / 144 | +6 / +15 / +12 % |
-| Cold prefill (median of 9, ~24-38K-token prompts) | 1,764 | 1,759 | +0.3 % | 2,457 | 2,375 | +3 % |
-| KV pool at 262,144 context (tokens) | 1,526,955 | 1,574,996 | −3 % | 2,539,313 | 2,539,313 | 0 % |
+| 1 user | **356 / 258 / 184** | 336 / 247 / 180 | +6 / +5 / +2 % | **118 / 91 / 63** | 118 / 92 / 64 | −1 / −2 / −1 % |
+| 2 users, aggregate | 433 / 244 / 239 | 419 / 238 / 228 | +3 / +2 / +5 % | 118 / 83 / 65 | 121 / 84 / 65 | −2 / 0 / 0 % |
+| 4 users, aggregate | 626 / 388 / 349 | 602 / 368 / 308 | +4 / +6 / +13 % | 206 / 143 / 105 | 209 / 145 / 115 | −1 / −1 / −8 % |
+| 8 users, aggregate | 868 / 544 / 441 | 813 / 505 / 385 | +7 / +8 / +14 % | 341 / 214 / 163 | 341 / 215 / 161 | 0 / −1 / +2 % |
+| Cold prefill (median of 9, ~24-38K-token prompts) | **2,416** | 1,764 | +37 % | 2,311 | 2,457 | −6 % |
+| KV pool at 262,144 context (tokens) | 1,395,731 | 1,526,955 | −9 % | 2,539,313 | 2,539,313 | 0 % |
 
 Decode rates are rounded to whole tok/s and the changes are computed from the exact values in
-[docs/results.md](docs/results.md). The KV pools hold 5.8 (TP4) and 9.7 (PP4) full-length requests. The gain is in
-decode: 1.1.0 adds CUDA kernels for the FP8 layers, tighter MoE decode loops, less per-step overhead, and
-confidence-gated verification, which skips the experts of drafts that the drafter itself expects to be rejected,
-without changing the output.
+[docs/results.md](docs/results.md). The KV pools hold 5.3 (TP4) and 9.7 (PP4) full-length requests. The gains are
+in prefill and in decode with several users: 1.2.0 runs the prefill all-reduces beside compute, ports Morrowmake's
+faster tensor-core MoE kernels, and verifies 3 instead of 5 drafts per step when the batch's recent acceptance says
+the last two rarely survive. The TP4 KV pool is smaller because of the decode graphs for those 3-draft steps. PP4 runs
+the same image on the 1.1.0 code paths; its differences are run-to-run spread (the cold prefill bench varies ±3–7 %
+between boots).
 
-Quality (TP4): HumanEval 156/164, GSM8K 1,273/1,319, scored on the answer after the reasoning. PP4 was measured on
-the same x16 host; on x4 links its decode should change little (activations only) while TP4 would slow down sharply.
+Quality (TP4): HumanEval 154/164, GSM8K 1,275/1,319 (1.1.0: 156 and 1,273), scored on the answer after the
+reasoning; the development build of 1.2.0 scored 156 and 1,276, and the problems that differ are within run-to-run
+spread (see [docs/results.md](docs/results.md)). PP4 was measured on the same x16 host; on x4 links its decode
+should change little (activations only) while TP4 would slow down sharply.
 
 ## Settings
 
@@ -93,12 +97,13 @@ All in `.env` (defaults in `.env.example`):
 | Setting | Default | |
 |---|---|---|
 | `LAYOUT` | `tp4` | `tp4` or `pp4` (see below) |
-| `MAX_MODEL_LEN` | `262144` | up to `1048576`, the model's native context (KV pool 1,426,183 tokens; slightly slower decode) |
+| `MAX_MODEL_LEN` | `262144` | up to `1048576`, the model's native context (KV pool 1,270,789 tokens; slightly slower decode) |
 | `MAX_NUM_SEQS` | `8` | concurrent requests |
 | `GPU_MEMORY_UTILIZATION` | `0.95` | |
 | `P2P` | `1` | `0` sends NCCL traffic through host memory |
 | `DSV41_GATE_TAU` | `0.10` | confidence-gated verification threshold; `0` verifies every draft (same output, slower) |
-| `DSV41_VARIANTS` | all four | runtime variants applied before CUDA graph capture; empty = none |
+| `DSV41_DYNK` | `accept:3,5` (tp4) | per-step verify width: 3 or 5 drafts, from each request's recent acceptance; empty = always 5 |
+| `DSV41_VARIANTS` | tp4: all twelve; pp4: the four of 1.1.0 | runtime variants applied before CUDA graph capture; empty = none |
 | `BIND`, `PORT` | `127.0.0.1`, `8000` | where the API is published |
 
 ## Choosing a layout

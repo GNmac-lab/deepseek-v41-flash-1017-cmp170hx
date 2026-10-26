@@ -10,11 +10,12 @@ is the same on every card under TP4 (the latent is not split by head).
 |---|---:|---:|
 | Weights and runtime (non-torch) | 54.3–54.5 GiB | 54.3–54.5 GiB |
 | Peak activation (2,048-token prefill chunk) + CUDA graphs | 2.5 + 1.2 GiB | ~0.7 GiB more (context-length workspaces) |
-| **KV cache** | **3.23 GiB = 1,526,955 tokens** | **2.55 GiB = 1,426,183 tokens** |
-| Full-length requests that fit | 5.8 | 1.36 |
+| **KV cache** | **2.95 GiB = 1,395,731 tokens** | **2.27 GiB = 1,270,789 tokens** |
+| Full-length requests that fit | 5.3 | 1.21 |
 
-1.0.0 had 3.33 GiB = 1,574,996 tokens at 262,144 context and 1,454,546 tokens at 1,048,576; 1.1.0 leaves about
-0.1 GiB less per card for the cache.
+1.0.0 had 3.33 GiB = 1,574,996 tokens at 262,144 context and 1,454,546 tokens at 1,048,576; 1.1.0 had 3.23 GiB =
+1,526,955 and 2.55 GiB = 1,426,183. 1.2.0 leaves 0.28 GiB less per card for the cache: the CUDA graphs for 3-draft
+decode steps (`DSV41_DYNK`) and the prefill slices' buffers.
 
 Two changes in this recipe made room (both bit-identical in output):
 
@@ -35,5 +36,6 @@ for the maximum context; cold prefill slows with context (1,399 tok/s at 170K; a
 ## Not possible here
 
 - Prefill chunks of 1,024 tokens (more KV room) do not start with images enabled: one image needs more than 1,024
-  tokens per step. 4,096-token chunks give ~4 % faster prefill but leave 848K tokens of KV instead of 1.53M.
+  tokens per step. 4,096-token chunks gave ~4 % faster prefill in 1.1.0 but left 848K tokens of KV instead of 1.53M;
+  with 1.2.0's prefill slices they gain ~1 % and the cold prefill bench ran out of memory.
 - A lower-precision KV cache would change the model's output; `fp8_ds_mla` is the model's native format.

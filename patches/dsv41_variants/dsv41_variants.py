@@ -11,7 +11,7 @@ import sys
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
-DEFAULT = "dsv41_topk_meta,dsv41_h2d_lean,dsv41_ragged_lean,dsv41_gate"
+DEFAULT = "dsv41_topk_meta,dsv41_h2d_lean,dsv41_ragged_lean,dsv41_gate,dsv41_ce_ring,dsv41_split_reduce,dsv41_moe_try,dsv41_engram_prefetch,dsv41_mhc_pcfg,dsv41_moe_v2try,dsv41_prefill_pack,dsv41_attn_slices"
 DIR = os.path.join(os.path.dirname(__file__), "dsv41_variants_d")
 _DONE = False
 

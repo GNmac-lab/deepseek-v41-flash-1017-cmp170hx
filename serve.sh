@@ -46,27 +46,32 @@ COMMON_ENV=(
   -e VLLM_DSV41_DECODE_SPLITK=1 -e DSV41_SHARED_HEAVY_BLOCKS=1 -e DSV41_DRAFT_HEAD_FP8=1
   -e DSV41_PREFILL_CHUNK_REQS=1 -e DSV41_INDEXER_BUF_MULT=4
 )
-# Optional engine knobs, passed only when set in .env: DSV41_VARIANTS (runtime variant list; empty = none),
-# DSV41_GATE_TAU (confidence-gated verification threshold; 0 = off)
-OPT_ENV=()
-for v in DSV41_VARIANTS DSV41_GATE_TAU; do
-  if [ -n "${!v+x}" ]; then OPT_ENV+=(-e "$v=${!v}"); fi
-done
 case "$LAYOUT" in
   tp4)
     PAR=(--tensor-parallel-size 4 --pipeline-parallel-size 1)
     LAYOUT_ENV=(-e VLLM_ALLREDUCE_USE_FLASHINFER_PCIE_IPC=1)
-    GRAPHS='{"cudagraph_mode": "FULL_AND_PIECEWISE", "cudagraph_capture_sizes": [1,2,3,4,5,6,8,12,18,24,30,36,42,48]}'
+    # 16/20/28/32: decode steps that verify 3 drafts per request (DSV41_DYNK)
+    GRAPHS='{"cudagraph_mode": "FULL_AND_PIECEWISE", "cudagraph_capture_sizes": [1,2,3,4,5,6,8,12,16,18,20,24,28,30,32,36,42,48]}'
     SCHED=(--async-scheduling)
+    : "${DSV41_DYNK=accept:3,5}"
     ;;
   pp4)
     PAR=(--tensor-parallel-size 1 --pipeline-parallel-size 4)
     LAYOUT_ENV=(-e VLLM_PP_LAYER_PARTITION="${PP_PARTITION:-10,11,11,8}")
     GRAPHS='{"cudagraph_mode": "PIECEWISE", "cudagraph_capture_sizes": [1,2,3,4,5,6,8,12,18,24,30,36,42,48]}'
     SCHED=()
+    # the 1.2.0 variants are tensor-parallel prefill and MoE paths: pipeline parallel keeps the 1.1.0 list
+    : "${DSV41_VARIANTS=dsv41_topk_meta,dsv41_h2d_lean,dsv41_ragged_lean,dsv41_gate}"
     ;;
   *) echo "LAYOUT must be tp4 or pp4"; exit 1 ;;
 esac
+# Engine knobs, passed when set (in .env or by the layout above): DSV41_VARIANTS (runtime variant list; empty =
+# none), DSV41_GATE_TAU (confidence-gated verification threshold; 0 = off), DSV41_DYNK (per-step DSpark verify
+# width; tp4 default accept:3,5; empty = always 5 drafts)
+OPT_ENV=()
+for v in DSV41_VARIANTS DSV41_GATE_TAU DSV41_DYNK; do
+  if [ -n "${!v+x}" ]; then OPT_ENV+=(-e "$v=${!v}"); fi
+done
 
 # The API has no authentication. It is published on $BIND only (127.0.0.1 by default): reach it from another
 # machine with an SSH local forward (ssh -N -L 127.0.0.1:$PORT:127.0.0.1:$PORT user@this-host), not a wider bind.

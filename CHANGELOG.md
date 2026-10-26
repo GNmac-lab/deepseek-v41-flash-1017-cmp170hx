@@ -1,5 +1,61 @@
 # Changelog
 
+## 1.2.0 — 2026-10-26
+
+Faster prefill and multi-user decode on the same cards, weights and settings. TP4, MiaAI-Lab protocol, structured /
+code / prose (median of 5 passes on one boot, as for 1.1.0): 1 user 355.7 / 258.4 / 183.6 tok/s (1.1.0: 336.0 /
+246.8 / 180.0), 4 users 626.4 / 387.8 / 348.7 (602.4 / 367.5 / 307.8), 8 users 867.6 / 544.0 / 440.5 (813.1 / 504.8 /
+385.1). Cold prefill 2,416 tok/s (1.1.0: 1,764, +37 %). KV pool 1,395,731 tokens at 262,144 context (1.1.0:
+1,526,955; the extra decode graph sizes for 3-draft steps). PP4 runs the 1.1.0 code paths (one pass: 1 user
+117.5 / 90.5 / 63.2, 8 users 340.5 / 213.9 / 163.1, cold prefill 2,311; 1.1.0: 118.3 / 92.2 / 63.8, 340.6 / 215.4 /
+160.5, 2,457). dqeval NLL 3.50001 vs 3.48019 (+0.57 %, 1.7 σ; 198 passages lower, 213 higher). HumanEval 154/164, GSM8K
+1,275/1,319 (1.1.0: 156, 1,273; the development build: 156, 1,276). 20-minute 8-stream soak: 1,018 requests, 0 errors,
+334.8 tok/s (1.1.0: 857, 281.0).
+
+The new paths are NLL-equivalent, not bit-identical: the prefill slices change dense GEMM tiling, the owner sum
+rounds once after an fp32 sum, and a narrower verify step is a different batch shape. This model amplifies rounding
+strongly (a 1-ulp bf16 change at layer 0 moves short-context prompt logprobs by up to several nats, as much as a
+different batch shape), so every change was checked with paired NLL over many passages, not token by token.
+
+### Prefill (TP4)
+
+- Each prefill layer's work after the attention core (`wo_a`, `wo_b`, mHC, MoE) runs in row slices, and the
+  tensor-parallel sums run on a side stream beside the next slice's compute (`dsv41_split_reduce`; the split
+  all-reduce design is Morrowmake's). The sums are a copy-engine owner sum (`dsv41_ce_ring`, a port of Morrowmake's
+  copy-engine all-reduce): each rank copies shard q into rank q's IPC scratch with `cudaMemcpyAsync`, rank q adds the
+  four partials in fp32 in rank order in one kernel and copies the result to its peers, and every flag is a stream
+  memory operation, so the compute beside it keeps its SMs. NCCL beside the same compute gained nothing.
+- Prefill attention runs per slice too (`dsv41_attn_slices`: per-slice attention metadata through vLLM's micro-batch
+  builder path), and layers overlap: a layer returns before its last FFN sums land and the next layer waits per
+  slice. Two slices, cut at 1,024 rows.
+- Morrowmake's second tensor-core prefill MoE schedule, built for the tensor-parallel expert shapes
+  (`dsv41_moe_try`, sources in `patches/tc_moe_try/`): bitwise equal to the 1.1.0 kernel; 1,024 rows 6.86 → 5.26 ms.
+- Engram rows of the next two prefill chunks are read into the page cache ahead of use (`dsv41_engram_prefetch`;
+  the n-gram hashes are computed on the CPU and checked equal to the GPU kernel's).
+- The fused mHC kernel uses prefill-sized tiles from 256 rows (`dsv41_mhc_pcfg`).
+- Sparse-attention prefill gathers are packed by each request's real width with upstream's chunk planner
+  (`dsv41_prefill_pack`): several short prompts share one gather instead of one per request (8-user time to first
+  token −10 %); a single request is bit-identical.
+
+### Decode
+
+- Routed-expert decode MoE on Morrowmake's faster lane-GEMM schedule (`dsv41_moe_v2try`, sources in
+  `patches/tc_moe_v2try/`), bitwise equal to the 1.1.0 tensor-core decode kernel and faster than the cooperative
+  kernel, so it now serves 1–64 rows: development build 1 user 333.5 / 244.2 / 181.4 → 358.3 / 268.1 / 194.1.
+- Per-step verify width (`DSV41_DYNK=accept:3,5`, TP4 default; `patches/dsv41_dynk.py`, `patch_dynk.py`): DSpark
+  still drafts its 5-token block, and the scheduler picks per step whether the next step verifies 3 or 5 drafts,
+  from each request's recent per-position acceptance and measured step costs. Every request in a step verifies the
+  same count, so the step stays a uniform decode and replays the FULL CUDA graph family for its query length (graph
+  sizes 16/20/28/32 added). Same-boot A-B-A on the development build, prose: 2 users 232 → 248, 4 users 306/316 →
+  349, 8 users 420/419 → 445 tok/s; structured, code and 1 user unchanged; HumanEval and GSM8K equal (2/2 and 6/6
+  discordant problems). The load-adaptive verify depth idea is Morrowmake's.
+
+### Not changed
+
+PP4 runs the same image with the 1.1.0 variant list and no verify-width change (`serve.sh` sets both). Prefill
+still runs eagerly: PIECEWISE CUDA graphs for prefill cut the 1-user time to first token from 121 to 68 ms, but
+failed 2 of 30 batched prefills beside a decode load (see docs/tuning-log.md).
+
 ## 1.1.0 — 2026-10-23
 
 Faster decode on the same cards, weights and settings. TP4, MiaAI-Lab protocol, structured / code / prose:
