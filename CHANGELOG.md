@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- `deepinfer_sm80_rocm.patch`: the decode top-K reuse is keyed on the indexer layer that wrote the rows and stored on
+  the compressed cache's per-source metadata; the prefill ragged lists are rebuilt per chunk. The earlier per-SWA-group
+  cache returned another indexer's rows at long range (73k to 92k prompt tokens), so verbatim copies out of the prompt
+  came back altered (image path segments rewritten, names drifted, some replies ran to max_tokens): 75 to 100 percent of
+  the copied image paths wrong on a six-context set, 0 of 103 with the keyed reuse. Decode and prefill unchanged within
+  the run-to-run spread (AB1 1 user 370.1 / 280.8 / 203.9 against 371.1 / 281.1 / 205.8 for 1.2.0 in the same session,
+  8 users 882.8 / 564.1 / 450.7 against 887.6 / 520.4 / 451.3). The `dsv41_prefill_pack` anchors move from 20 to 16
+  leading spaces to follow the shallower block.
+
 ## 1.2.0 — 2026-10-26
 
 Faster prefill and multi-user decode on the same cards, weights and settings. TP4, MiaAI-Lab protocol, structured /
