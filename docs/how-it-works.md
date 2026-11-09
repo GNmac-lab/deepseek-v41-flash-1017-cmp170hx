@@ -46,7 +46,7 @@ passage's NLL matched exactly.
 | `patch_mhc_fused.py` | token-blocked Triton kernel for mHC post + pre; sinkhorn forked beside the next all-reduce | structured 227 | residual bit-identical |
 | `install_fipcie.py` | FlashInfer PCIe IPC all-reduce (0.7.0.post1) in the image's FlashInfer 0.6.18 | 61 KB all-reduce 57.6 → 42.6 µs; structured 235 | sum order |
 | `deepinfer_sm80_attn.patch` | Deepinfer-SM80 sparse-attention decode tile | structured 245 | bit-identical |
-| `deepinfer_sm80_rocm.patch` | Deepinfer-SM80 top-K/SWA combiner + decode top-K reuse | prefill +5–7 %, TTFT 0.18 → 0.13 s | bit-identical |
+| `deepinfer_sm80_rocm.patch` | Deepinfer-SM80 top-K/SWA combiner + decode top-K reuse keyed on the indexer window (the unkeyed per-SWA-group reuse returned another indexer's rows at long range) | prefill +5–7 %, TTFT 0.18 → 0.13 s | bit-identical |
 | `patch_coop_mma_swap.py` | coop tile feeds decoded weights as the MMA A operand: one MMA per tile, no padded rows | gate/up −12.7 %, down −12 %; structured 262, prose 138 | bit-identical |
 | `patch_v32_wo_a.py`, `vllm-exl3/patch_exl3_ids_cast.py` | attention `wo_a` as an FP8 grouped Triton GEMM (exact FP8 codes recovered from the bf16 weight) | 26.0 → 14.8 µs/layer; prose 145 | noise-level |
 | `patch_true_ring.py` | cut-through neighbour-ring all-reduce variant (no barriers, per-pack arrival signal) | 6-token all-reduce 42.6 → 18.2 µs; step −10.6 %; prose 153 | sum order |

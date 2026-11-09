@@ -60,10 +60,10 @@ def _patched():
         "            assert chunk_size * M <= _cap, (chunk_size, M, _cap)\n"
         "            kv = kv_full.view(-1, q.shape[-1])[: chunk_size * M].view(chunk_size, M, q.shape[-1])\n")
     src = old.sub(lambda m: new, src)
-    a = "                    num_rows=self.PREFILL_CHUNK_SIZE * M,\n"
+    a = "                num_rows=self.PREFILL_CHUNK_SIZE * M,\n"
     if src.count(a) != 1:
         raise RuntimeError("dsv41_prefill_pack: num_rows anchor not found")
-    src = src.replace(a, "                    num_rows=chunk_size * M,\n")
+    src = src.replace(a, "                num_rows=chunk_size * M,\n")
     src = textwrap.dedent(src)
     ns = dict(vars(_r))
     ns["_dsv41_pack_plan"] = _plan
